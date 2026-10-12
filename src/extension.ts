@@ -18,6 +18,8 @@ const SNAPSHOT_KEY = "claudeRestore.snapshot";
 // the user answers does not lose them.
 const PENDING_KEY = "claudeRestore.pending";
 const PROMPT_DELAY_MS = 8000;
+const PROCESS_ID_TIMEOUT_MS = 3000;
+const TICK_STUCK_MS = 60000;
 const CLAUDE_EXTENSION_ID = "anthropic.claude-code";
 
 let log: vscode.OutputChannel;
@@ -62,15 +64,22 @@ export async function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
+function withTimeout<T>(value: Thenable<T>, ms: number): Promise<T | undefined> {
+  return Promise.race([Promise.resolve(value), new Promise<undefined>((r) => setTimeout(() => r(undefined), ms))]);
+}
+
 class WindowTracker {
   private chains = new Map<number, number[]>();
-  private busy = false;
+  private busySince = 0;
+  private lastSummary = "";
 
   constructor(private state: vscode.Memento) {}
 
   async tick() {
-    if (this.busy) return;
-    this.busy = true;
+    // Skip while a snapshot is in progress, but never let a stuck one block tracking for good.
+    if (this.busySince && Date.now() - this.busySince < TICK_STUCK_MS) return;
+    if (this.busySince) log.appendLine("Previous snapshot never finished; starting a new one.");
+    this.busySince = Date.now();
     try {
       const live = liveEntries(readRegistry());
       const missing = live.filter((e) => !this.chains.has(e.pid));
@@ -88,7 +97,9 @@ class WindowTracker {
       const shellPids = new Map<number, number>();
       await Promise.all(
         terminals.map(async (t, index) => {
-          const pid = await t.processId;
+          // A terminal that never started (or an extension's pseudo-terminal) can leave
+          // processId pending forever; without a timeout that would stall every later snapshot.
+          const pid = await withTimeout(t.processId, PROCESS_ID_TIMEOUT_MS);
           if (pid !== undefined) shellPids.set(pid, index);
         }),
       );
@@ -114,10 +125,14 @@ class WindowTracker {
 
       const previous = this.state.get<TrackedSession[]>(SNAPSHOT_KEY, []);
       await this.state.update(SNAPSHOT_KEY, nextSnapshot(previous, current));
+
+      const summary = `Tracking ${current.length} session(s); ${terminals.length} terminal(s), ${shellPids.size} with a shell process.`;
+      if (summary !== this.lastSummary) log.appendLine(`${new Date().toLocaleTimeString()} ${summary}`);
+      this.lastSummary = summary;
     } catch (err) {
       log.appendLine(`Snapshot failed: ${err}`);
     } finally {
-      this.busy = false;
+      this.busySince = 0;
     }
   }
 }
