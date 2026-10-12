@@ -2,7 +2,7 @@
   "name": "claude-session-restore",
   "displayName": "Claude Session Restore",
   "description": "Offers to reopen the Claude Code sessions (terminal and chat panel) that were running when a VS Code window last closed or crashed.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -15,6 +15,10 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Brandon-Haney/claude-session-restore.git"
+  },
   "contributes": {
     "commands": [
       {

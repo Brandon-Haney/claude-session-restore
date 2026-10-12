@@ -19,7 +19,7 @@ Inspired by [Claude Sessions Restore](https://marketplace.visualstudio.com/items
 
 ## When Claude Code changes
 
-The session registry is undocumented, so the extension checks every minute that it still matches what it expects, and says so loudly when it does not:
+The session registry is undocumented, so the extension checks that it still matches what it expects, and says so loudly when it does not. Checks run once a minute for five minutes after anything that could reveal a change (the window opens, a terminal opens, a new Claude session appears), plus every 15 minutes as a backstop for `claude` started in a terminal that was already open. The rest of the time it stays idle.
 
 | Check | Problem code |
 |---|---|

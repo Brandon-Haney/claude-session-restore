@@ -35,7 +35,12 @@ const PROMPT_DELAY_MS = 8000;
 const PROCESS_ID_TIMEOUT_MS = 3000;
 const TICK_STUCK_MS = 60000;
 const CLAUDE_EXTENSION_ID = "anthropic.claude-code";
-const HEALTH_INTERVAL_MS = 60000;
+// Compatibility checks run in a short burst after anything that could reveal a change
+// (window opens, a terminal opens, a new Claude session appears), plus a slow backstop
+// for e.g. `claude` started in a terminal that was already open.
+const HEALTH_BURST_INTERVAL_MS = 60000;
+const HEALTH_BURST_LENGTH_MS = 5 * 60000;
+const HEALTH_BACKSTOP_INTERVAL_MS = 15 * 60000;
 // A claude process must stay untracked this many checks (a few minutes) before it
 // counts, so a session that has only just started is never reported.
 const UNTRACKED_CHECKS_BEFORE_ALERT = 3;
@@ -63,15 +68,19 @@ export async function activate(context: vscode.ExtensionContext) {
   let lastOffered = candidates;
   log.appendLine(`Activated. ${previous.length} session(s) recorded last run, ${pending.length} unanswered.`);
 
-  const tracker = new WindowTracker(state);
+  const tracker = new WindowTracker(state, () => health?.trigger("new Claude session"));
   const interval = Math.max(3, config().get<number>("snapshotIntervalSeconds", 10)) * 1000;
   const timer = setInterval(() => void tracker.tick(), interval);
   context.subscriptions.push({ dispose: () => clearInterval(timer) });
   void tracker.tick();
 
   health = new HealthMonitor(context, tracker);
-  const healthTimer = setInterval(() => void health.check(), HEALTH_INTERVAL_MS);
-  context.subscriptions.push({ dispose: () => clearInterval(healthTimer) });
+  context.subscriptions.push(
+    health,
+    vscode.window.onDidOpenTerminal(() => health.trigger("terminal opened")),
+  );
+  // After the restore prompt, so sessions restored at launch are part of the first burst.
+  setTimeout(() => health.trigger("window opened"), PROMPT_DELAY_MS);
 
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeRestore.restore", () => offer(lastOffered, state, true)),
@@ -116,7 +125,10 @@ class WindowTracker {
   /** Claude processes recorded by the last snapshot. */
   trackedPids = new Set<number>();
 
-  constructor(private state: vscode.Memento) {}
+  constructor(
+    private state: vscode.Memento,
+    private onNewSession: () => void,
+  ) {}
 
   async tick() {
     // Skip while a snapshot is in progress, but never let a stuck one block tracking for good.
@@ -127,6 +139,7 @@ class WindowTracker {
       const live = liveEntries(readRegistry());
       const missing = live.filter((e) => !this.chains.has(e.pid));
       if (missing.length > 0) {
+        this.onNewSession();
         // Process ancestry never changes, so the process table is only read when a new session appears.
         const procs = await listProcesses();
         for (const e of missing) {
@@ -307,9 +320,35 @@ class HealthMonitor {
   private noticesLogged = new Set<string>();
   private busy = false;
   private extensionVersion: string;
+  private burstTimer: ReturnType<typeof setInterval> | undefined;
+  private burstUntil = 0;
+  private backstopTimer: ReturnType<typeof setInterval>;
 
   constructor(private context: vscode.ExtensionContext, private tracker: WindowTracker) {
     this.extensionVersion = context.extension.packageJSON.version ?? "unknown";
+    this.backstopTimer = setInterval(() => void this.check(), HEALTH_BACKSTOP_INTERVAL_MS);
+  }
+
+  /** Checks now and once a minute for the next few minutes, long enough to judge a new session. */
+  trigger(reason: string) {
+    const extending = this.burstTimer !== undefined;
+    this.burstUntil = Date.now() + HEALTH_BURST_LENGTH_MS;
+    if (extending) return;
+    log.appendLine(`${new Date().toLocaleTimeString()} Compatibility checks for the next ${HEALTH_BURST_LENGTH_MS / 60000} min (${reason}).`);
+    void this.check();
+    this.burstTimer = setInterval(() => {
+      if (Date.now() > this.burstUntil) {
+        clearInterval(this.burstTimer);
+        this.burstTimer = undefined;
+        return;
+      }
+      void this.check();
+    }, HEALTH_BURST_INTERVAL_MS);
+  }
+
+  dispose() {
+    clearInterval(this.backstopTimer);
+    if (this.burstTimer) clearInterval(this.burstTimer);
   }
 
   async check(fromCommand = false) {
@@ -331,6 +370,8 @@ class HealthMonitor {
       const counts = new Map<number, number>();
       for (const pid of untracked) counts.set(pid, (this.untrackedChecks.get(pid) ?? 0) + 1);
       this.untrackedChecks = counts;
+      // Confirm quickly instead of waiting for several backstop checks.
+      if (untracked.length > 0 && this.burstTimer === undefined) this.trigger("untracked Claude process");
       const persistent = [...counts].filter(([, n]) => n >= UNTRACKED_CHECKS_BEFORE_ALERT).map(([pid]) => pid);
 
       const problems = registryProblems(scan, persistent);
