@@ -4,7 +4,7 @@ Reopens the Claude Code sessions that were running in a VS Code window when it l
 
 > **Unofficial.** Not made by or affiliated with Anthropic.
 >
-> **Status: early.** Tracking and window reloads have been tested on Windows; restoring after a full crash or force close has not yet been tested end to end.
+> **Status: early.** Tested on Windows only: tracking, window reloads, a force close and a normal quit, with 8 sessions across 3 windows.
 
 Inspired by [Claude Sessions Restore](https://marketplace.visualstudio.com/items?itemName=fahadjabbar.claude-sessions-restore) by Fahad Jabbar (MIT), rewritten to restore only what was actually open.
 
@@ -75,5 +75,5 @@ Run **Claude Session Restore: Check Compatibility with Claude Code** at any time
 npm install
 npm test
 npm run package   # produces claude-session-restore-<version>.vsix
-code --install-extension claude-session-restore-0.1.0.vsix
+code --install-extension claude-session-restore-<version>.vsix
 ```
