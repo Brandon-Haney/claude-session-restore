@@ -3,4 +3,5 @@ src/**
 test/**
 tsconfig.json
 .gitignore
-dist/tracker.test-build.js
+dist/*.test-build.js
+hooks/**

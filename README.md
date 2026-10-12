@@ -17,10 +17,41 @@ Inspired by [Claude Sessions Restore](https://marketplace.visualstudio.com/items
 - On the next startup it waits a few seconds (so the Claude Code extension can restore its own chat tabs), then offers anything recorded that is no longer running: **Restore All**, **Choose…** or **Dismiss**.
 - Terminal sessions reopen in a new terminal in their original folder with `claude --resume <id>`. Chat panel sessions reopen in the panel through `vscode://anthropic.claude-code/open?session=<id>`; if the tab is already open it is just focused.
 
+## When Claude Code changes
+
+The session registry is undocumented, so the extension checks every minute that it still matches what it expects, and says so loudly when it does not:
+
+| Check | Problem code |
+|---|---|
+| `claude` has been running in one of this window's terminals for a few minutes with no entry in `~/.claude/sessions/` | `registry-missing-sessions` |
+| …and `~/.claude/sessions/` does not exist at all | `registry-dir-missing` |
+| It has an entry, but one the extension no longer recognises (changed `kind` or `entrypoint`) | `registry-sessions-unrecognised` |
+| Registry files no longer have `pid`, `sessionId` and `cwd` | `registry-format-changed` |
+| A restored terminal session is not running a minute after `claude --resume` was sent | `resume-not-running` |
+
+New `kind` or `entrypoint` values and Claude Code version changes are noted in the output log without an alert.
+
+A problem is reported in three places:
+
+1. A VS Code warning (at most once a day per problem) with **Show Log** and **Investigate with Claude**, which opens Claude Code in `claudeRestore.sourceFolder`.
+2. `~/.claude-session-restore/health.json`, shared by all windows. Problems stay in it while they last and expire an hour after they were last seen (three days for a failed resume).
+3. An optional Claude Code `SessionStart` hook, [`hooks/session-start-health.mjs`](hooks/session-start-health.mjs), which shows a warning when a Claude session starts and gives Claude the details so it can offer to investigate. It is silent when everything is fine. To install, copy it to `~/.claude/hooks/` and add to `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "SessionStart": [
+    { "matcher": "startup|resume", "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/session-start-health.mjs\"", "timeout": 10 }] }
+  ]
+}
+```
+
+Run **Claude Session Restore: Check Compatibility with Claude Code** at any time for an immediate check.
+
 ## Commands
 
 - **Claude Session Restore: Restore Sessions from Last Run**: pick from the last run's sessions again, e.g. after dismissing the prompt.
 - **Claude Session Restore: Show Tracked Sessions**: what this window is currently recording.
+- **Claude Session Restore: Check Compatibility with Claude Code**: run the checks below now.
 
 ## Settings
 
@@ -30,6 +61,7 @@ Inspired by [Claude Sessions Restore](https://marketplace.visualstudio.com/items
 | `claudeRestore.includeChatPanel` | `true` | Also track chat panel sessions. |
 | `claudeRestore.snapshotIntervalSeconds` | `10` | How often sessions are recorded. |
 | `claudeRestore.resumeCommand` | `claude --resume ${sessionId}` | Command typed into restored terminals. |
+| `claudeRestore.sourceFolder` | first workspace folder | Where **Investigate with Claude** opens Claude Code. |
 
 ## Limits
 

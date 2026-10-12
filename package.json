@@ -2,14 +2,18 @@
   "name": "claude-session-restore",
   "displayName": "Claude Session Restore",
   "description": "Offers to reopen the Claude Code sessions (terminal and chat panel) that were running when a VS Code window last closed or crashed.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {
     "vscode": "^1.95.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -20,6 +24,10 @@
       {
         "command": "claudeRestore.showTracked",
         "title": "Claude Session Restore: Show Tracked Sessions"
+      },
+      {
+        "command": "claudeRestore.checkHealth",
+        "title": "Claude Session Restore: Check Compatibility with Claude Code"
       }
     ],
     "configuration": {
@@ -45,13 +53,18 @@
           "type": "string",
           "default": "claude --resume ${sessionId}",
           "description": "Command typed into the new terminal to resume a terminal session. ${sessionId} is replaced with the session's id."
+        },
+        "claudeRestore.sourceFolder": {
+          "type": "string",
+          "default": "",
+          "description": "Folder of this extension's source code. \"Investigate with Claude\" opens Claude Code there when a compatibility problem is found. Defaults to the first workspace folder."
         }
       }
     }
   },
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
-    "test": "esbuild src/tracker.ts --bundle --platform=node --format=cjs --outfile=dist/tracker.test-build.js && node --test test/tracker.test.js",
+    "test": "esbuild src/health.ts --bundle --platform=node --format=cjs --outfile=dist/health.test-build.js && esbuild src/tracker.ts --bundle --platform=node --format=cjs --outfile=dist/tracker.test-build.js && node --test test/tracker.test.js test/health.test.js test/hook.test.js",
     "package": "npm run build && vsce package --no-dependencies --allow-missing-repository"
   },
   "devDependencies": {

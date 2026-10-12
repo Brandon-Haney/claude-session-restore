@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import {
@@ -9,9 +10,22 @@ import {
   ownership,
   readLastPrompts,
   readRegistry,
+  claudeDir,
   sessionsToOffer,
   TrackedSession,
 } from "./tracker";
+import {
+  claudeProcessesUnderShells,
+  EVENT_ISSUE_TTL_MS,
+  mergeHealth,
+  PERSISTENT_ISSUE_TTL_MS,
+  readHealth,
+  registryNotices,
+  registryProblems,
+  scanRegistry,
+  Severity,
+  writeHealth,
+} from "./health";
 
 const SNAPSHOT_KEY = "claudeRestore.snapshot";
 // Sessions offered but not yet answered. Kept separately so a second crash before
@@ -21,8 +35,16 @@ const PROMPT_DELAY_MS = 8000;
 const PROCESS_ID_TIMEOUT_MS = 3000;
 const TICK_STUCK_MS = 60000;
 const CLAUDE_EXTENSION_ID = "anthropic.claude-code";
+const HEALTH_INTERVAL_MS = 60000;
+// A claude process must stay untracked this many checks (a few minutes) before it
+// counts, so a session that has only just started is never reported.
+const UNTRACKED_CHECKS_BEFORE_ALERT = 3;
+const RESUME_VERIFY_DELAY_MS = 60000;
+const ALERTED_KEY = "claudeRestore.alerted";
+const ALERT_REPEAT_MS = 24 * 60 * 60 * 1000;
 
 let log: vscode.OutputChannel;
+let health: HealthMonitor;
 
 function config() {
   return vscode.workspace.getConfiguration("claudeRestore");
@@ -47,9 +69,14 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push({ dispose: () => clearInterval(timer) });
   void tracker.tick();
 
+  health = new HealthMonitor(context, tracker);
+  const healthTimer = setInterval(() => void health.check(), HEALTH_INTERVAL_MS);
+  context.subscriptions.push({ dispose: () => clearInterval(healthTimer) });
+
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeRestore.restore", () => offer(lastOffered, state, true)),
     vscode.commands.registerCommand("claudeRestore.showTracked", () => showTracked(state)),
+    vscode.commands.registerCommand("claudeRestore.checkHealth", () => health.check(true)),
   );
 
   if (candidates.length === 0) return;
@@ -64,6 +91,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
+/** This window's terminal shell pids, mapped to the terminal's position. */
+async function windowShellPids(): Promise<Map<number, number>> {
+  const shellPids = new Map<number, number>();
+  await Promise.all(
+    vscode.window.terminals.map(async (t, index) => {
+      // A terminal that never started (or an extension's pseudo-terminal) can leave
+      // processId pending forever; without a timeout that would stall every later snapshot.
+      const pid = await withTimeout(t.processId, PROCESS_ID_TIMEOUT_MS);
+      if (pid !== undefined) shellPids.set(pid, index);
+    }),
+  );
+  return shellPids;
+}
+
 function withTimeout<T>(value: Thenable<T>, ms: number): Promise<T | undefined> {
   return Promise.race([Promise.resolve(value), new Promise<undefined>((r) => setTimeout(() => r(undefined), ms))]);
 }
@@ -72,6 +113,8 @@ class WindowTracker {
   private chains = new Map<number, number[]>();
   private busySince = 0;
   private lastSummary = "";
+  /** Claude processes recorded by the last snapshot. */
+  trackedPids = new Set<number>();
 
   constructor(private state: vscode.Memento) {}
 
@@ -94,24 +137,18 @@ class WindowTracker {
       for (const pid of this.chains.keys()) if (!livePids.has(pid)) this.chains.delete(pid);
 
       const terminals = vscode.window.terminals;
-      const shellPids = new Map<number, number>();
-      await Promise.all(
-        terminals.map(async (t, index) => {
-          // A terminal that never started (or an extension's pseudo-terminal) can leave
-          // processId pending forever; without a timeout that would stall every later snapshot.
-          const pid = await withTimeout(t.processId, PROCESS_ID_TIMEOUT_MS);
-          if (pid !== undefined) shellPids.set(pid, index);
-        }),
-      );
+      const shellPids = await windowShellPids();
 
       const includePanel = config().get<boolean>("includeChatPanel", true);
       const now = Date.now();
       const current: TrackedSession[] = [];
+      const tracked = new Set<number>();
       for (const entry of live) {
         const chain = this.chains.get(entry.pid);
         if (!chain) continue;
         const owner = ownership(entry, chain, new Set(shellPids.keys()), process.pid);
         if (!owner || (owner.kind === "panel" && !includePanel)) continue;
+        tracked.add(entry.pid);
         current.push({
           sessionId: entry.sessionId,
           cwd: entry.cwd,
@@ -125,6 +162,7 @@ class WindowTracker {
 
       const previous = this.state.get<TrackedSession[]>(SNAPSHOT_KEY, []);
       await this.state.update(SNAPSHOT_KEY, nextSnapshot(previous, current));
+      this.trackedPids = tracked;
 
       const summary = `Tracking ${current.length} session(s); ${terminals.length} terminal(s), ${shellPids.size} with a shell process.`;
       if (summary !== this.lastSummary) log.appendLine(`${new Date().toLocaleTimeString()} ${summary}`);
@@ -226,6 +264,16 @@ async function restore(s: TrackedSession) {
   terminal.sendText(command, true);
   terminal.show(true);
   log.appendLine(`Resumed terminal session ${s.sessionId} in ${s.cwd}.`);
+  setTimeout(() => {
+    // Closed by the user in the meantime, or resumed fine: nothing to report.
+    if (terminal.exitStatus !== undefined || liveSessionIds().has(s.sessionId)) return;
+    health.report(
+      "resume-not-running",
+      "error",
+      `A restored terminal session (${s.sessionId}) was not running ${RESUME_VERIFY_DELAY_MS / 1000}s after "${command}" was sent. The resume command may have changed, the transcript may have been deleted, or Claude Code may no longer record resumed sessions in ~/.claude/sessions/. Check the restored terminal for an error.`,
+      EVENT_ISSUE_TTL_MS,
+    );
+  }, RESUME_VERIFY_DELAY_MS);
 }
 
 async function showTracked(state: vscode.Memento) {
@@ -247,4 +295,103 @@ function ago(timestamp: number): string {
   const hours = Math.round(minutes / 60);
   if (hours < 48) return `${hours} h ago`;
   return `${Math.round(hours / 24)} days ago`;
+}
+
+/**
+ * Watches for signs that Claude Code changed the undocumented files this extension
+ * relies on. Problems go to the output log, a VS Code warning, and a shared health
+ * file that a Claude Code SessionStart hook reads to tell new sessions about it.
+ */
+class HealthMonitor {
+  private untrackedChecks = new Map<number, number>();
+  private noticesLogged = new Set<string>();
+  private busy = false;
+  private extensionVersion: string;
+
+  constructor(private context: vscode.ExtensionContext, private tracker: WindowTracker) {
+    this.extensionVersion = context.extension.packageJSON.version ?? "unknown";
+  }
+
+  async check(fromCommand = false) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const scan = scanRegistry(claudeDir());
+      const claudeVersion = [...scan.versions].sort().pop();
+      this.noteClaudeVersion(claudeVersion);
+      for (const notice of registryNotices(scan)) {
+        if (this.noticesLogged.has(notice)) continue;
+        this.noticesLogged.add(notice);
+        log.appendLine(`Notice: ${notice}`);
+      }
+
+      const shellPids = new Set((await windowShellPids()).keys());
+      const procs = shellPids.size > 0 ? await listProcesses() : new Map();
+      const untracked = claudeProcessesUnderShells(procs, shellPids).filter((pid) => !this.tracker.trackedPids.has(pid));
+      const counts = new Map<number, number>();
+      for (const pid of untracked) counts.set(pid, (this.untrackedChecks.get(pid) ?? 0) + 1);
+      this.untrackedChecks = counts;
+      const persistent = [...counts].filter(([, n]) => n >= UNTRACKED_CHECKS_BEFORE_ALERT).map(([pid]) => pid);
+
+      const problems = registryProblems(scan, persistent);
+      for (const p of problems) this.report(p.code, "error", p.message, PERSISTENT_ISSUE_TTL_MS, claudeVersion);
+      if (problems.length === 0) this.report(null, "info", "", 0, claudeVersion);
+
+      if (fromCommand) {
+        const active = readHealth()?.issues.filter((i) => i.severity === "error" && i.expiresAt > Date.now()) ?? [];
+        if (active.length === 0) {
+          vscode.window.showInformationMessage(
+            `Claude Session Restore: no compatibility problems found (Claude Code ${claudeVersion ?? "version unknown"}, tracking ${this.tracker.trackedPids.size} session(s) in this window).`,
+          );
+        } else {
+          log.show(true);
+          vscode.window.showWarningMessage(`Claude Session Restore: ${active.length} compatibility problem(s); details are in the output log.`);
+          for (const i of active) log.appendLine(`Problem [${i.code}]: ${i.message}`);
+        }
+      }
+    } catch (err) {
+      log.appendLine(`Health check failed: ${err}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** Records a problem in the shared health file and alerts once a day per problem. Pass a null code to just refresh the file. */
+  report(code: string | null, severity: Severity, message: string, ttlMs: number, claudeVersion?: string) {
+    try {
+      const reported = code ? [{ code, severity, message, ttlMs, claudeVersion }] : [];
+      writeHealth(mergeHealth(readHealth(), reported, this.extensionVersion));
+    } catch (err) {
+      log.appendLine(`Could not write the health file: ${err}`);
+    }
+    if (!code || severity !== "error") return;
+    log.appendLine(`${new Date().toLocaleTimeString()} Problem [${code}]: ${message}`);
+    const alerted = this.context.globalState.get<Record<string, number>>(ALERTED_KEY, {});
+    if (Date.now() - (alerted[code] ?? 0) < ALERT_REPEAT_MS) return;
+    void this.context.globalState.update(ALERTED_KEY, { ...alerted, [code]: Date.now() });
+    void vscode.window
+      .showWarningMessage(`Claude Session Restore may not work with this Claude Code version: ${message}`, "Show Log", "Investigate with Claude")
+      .then((answer) => {
+        if (answer === "Show Log") log.show(true);
+        if (answer === "Investigate with Claude") investigate();
+      });
+  }
+
+  private noteClaudeVersion(version: string | undefined) {
+    if (!version) return;
+    const key = "claudeRestore.lastClaudeVersion";
+    const last = this.context.globalState.get<string>(key);
+    if (last === version) return;
+    void this.context.globalState.update(key, version);
+    if (last) log.appendLine(`Claude Code updated from ${last} to ${version}; compatibility checks will flag anything that changed.`);
+  }
+}
+
+/** Opens Claude Code in the extension's source folder; the SessionStart hook hands it the problem details. */
+function investigate() {
+  const configured = config().get<string>("sourceFolder", "").trim().replace(/^~(?=$|[\\/])/, os.homedir());
+  const folder = configured && fs.existsSync(configured) ? configured : vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const terminal = vscode.window.createTerminal({ name: "claude · investigate", cwd: folder });
+  terminal.sendText("claude", true);
+  terminal.show();
 }
