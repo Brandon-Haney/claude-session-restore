@@ -269,10 +269,9 @@ async function restore(s: TrackedSession) {
     return;
   }
 
-  const terminal = vscode.window.createTerminal({
-    name: `claude · ${path.basename(s.cwd)}`,
-    cwd: cwdExists ? s.cwd : undefined,
-  });
+  // No fixed name: a name set here would override the title Claude Code gives the tab
+  // (the conversation's title), so every restored tab would look the same.
+  const terminal = vscode.window.createTerminal({ cwd: cwdExists ? s.cwd : undefined });
   const command = config().get<string>("resumeCommand", "claude --resume ${sessionId}").split("${sessionId}").join(s.sessionId);
   terminal.sendText(command, true);
   terminal.show(true);
@@ -432,7 +431,7 @@ class HealthMonitor {
 function investigate() {
   const configured = config().get<string>("sourceFolder", "").trim().replace(/^~(?=$|[\\/])/, os.homedir());
   const folder = configured && fs.existsSync(configured) ? configured : vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  const terminal = vscode.window.createTerminal({ name: "claude · investigate", cwd: folder });
+  const terminal = vscode.window.createTerminal({ cwd: folder });
   terminal.sendText("claude", true);
   terminal.show();
 }
