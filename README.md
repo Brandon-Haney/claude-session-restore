@@ -2,6 +2,10 @@
 
 Reopens the Claude Code sessions that were running in a VS Code window when it last closed or crashed, the way a browser offers to restore its tabs.
 
+> **Unofficial.** Not made by or affiliated with Anthropic.
+>
+> **Status: early.** Tracking and window reloads have been tested on Windows; restoring after a full crash or force close has not yet been tested end to end.
+
 Inspired by [Claude Sessions Restore](https://marketplace.visualstudio.com/items?itemName=fahadjabbar.claude-sessions-restore) by Fahad Jabbar (MIT), rewritten to restore only what was actually open.
 
 ## How it works
